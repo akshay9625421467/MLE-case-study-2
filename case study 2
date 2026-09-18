@@ -1,1 +1,141 @@
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    classification_report, 
+    confusion_matrix, 
+    roc_auc_score, 
+    precision_recall_curve, 
+    auc
+)
 
+# ---------------------------------------------------------
+# 1. DATA SIMULATION / INGESTION PIPELINE
+# ---------------------------------------------------------
+def load_and_preprocess_data():
+    """
+    Simulates or loads the structure of a highly imbalanced fraud dataset.
+    Replicates typical IEEE-CIS numerical distributions.
+    """
+    print("[INFO] Initializing dataset pipeline...")
+    np.random.seed(42)
+    
+    # Simulate a heavily skewed dataset (e.g., ~0.2% fraud rate like IEEE-CIS / Kaggle datasets)
+    n_samples = 200000
+    n_fraud = int(n_samples * 0.002)
+    n_normal = n_samples - n_fraud
+    
+    # Generate engineered and latent features (V1-V28 or anonymized components)
+    normal_features = np.random.normal(loc=0.0, scale=1.0, size=(n_normal, 30))
+    fraud_features = np.random.normal(loc=1.5, scale=2.0, size=(n_fraud, 30))
+    
+    X = np.vstack([normal_features, fraud_features])
+    y = np.array([0] * n_normal + [1] * n_fraud)
+    
+    # Convert to DataFrame
+    feature_names = ['TransactionAmt'] + [f'V_{i}' for i in range(1, 30)]
+    df = pd.DataFrame(X, columns=feature_names)
+    df['isFraud'] = y
+    
+    # Enforce data separation
+    X_raw = df.drop(columns=['isFraud'])
+    y_raw = df['isFraud']
+    
+    # Stratified split to preserve the 0.2% fraud distribution in train & validation sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_raw, y_raw, test_size=0.2, random_state=42, stratify=y_raw
+    )
+    
+    # Feature Scaling (Critical for numerical stability across transaction amplitudes)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    return X_train_scaled, X_test_scaled, y_train, y_test, feature_names
+
+# ---------------------------------------------------------
+# 2. XGBOOST ENGINE SETUP WITH IMBALANCE HANDLING
+# ---------------------------------------------------------
+def train_fraud_detector(X_train, X_test, y_train, y_test):
+    print("[INFO] Configuring XGBoost model...")
+    
+    # MLE Trick: Calculate scale_pos_weight to counteract severe imbalance
+    # Formula: sum(negative instances) / sum(positive instances)
+    neg_count = np.sum(y_train == 0)
+    pos_count = np.sum(y_train == 1)
+    scale_weight = neg_count / pos_count
+    print(f"[MLE INFO] Calculated 'scale_pos_weight': {scale_weight:.2f}")
+    
+    # Convert data matrices into high-performance XGBoost DMatrix structures
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtest = xgb.DMatrix(X_test, label=y_test)
+    
+    # Hyperparameters optimized specifically for fraud detection tasks
+    params = {
+        'max_depth': 6,
+        'learning_rate': 0.1,
+        'objective': 'binary:logistic',
+        'eval_metric': ['auc', 'aucpr'], # Track both ROC-AUC and Precision-Recall AUC
+        'scale_pos_weight': scale_weight,
+        'tree_method': 'hist',            # Leverages CPU/GPU histogram binning for speed
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'seed': 42
+    }
+    
+    evallist = [(dtrain, 'train'), (dtest, 'eval')]
+    
+    print("[INFO] Commencing model training optimization loops...")
+    # Train using Native API for explicit early stopping handling
+    model = xgb.train(
+        params=params,
+        dtrain=dtrain,
+        num_boost_round=500,
+        evals=evallist,
+        early_stopping_rounds=30,
+        verbose_eval=50
+    )
+    
+    return model, dtest
+
+# ---------------------------------------------------------
+# 3. PRODUCTION EVALUATION LAYER
+# ---------------------------------------------------------
+def evaluate_model(model, dtest, y_test):
+    print("\n[INFO] Running model evaluation protocols...")
+    
+    # Obtain raw probability predictions
+    y_pred_proba = model.predict(dtest, iteration_range=(0, model.best_iteration + 1))
+    
+    # Define an evaluation boundary threshold (tune based on corporate risk appetite)
+    threshold = 0.5
+    y_pred_bin = (y_pred_proba >= threshold).astype(int)
+    
+    # Performance Core Metrics
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    precision_vals, recall_vals, _ = precision_recall_curve(y_test, y_pred_proba)
+    pr_auc = auc(recall_vals, precision_vals)
+    
+    print("\n================== METRICS REPORT ==================")
+    print(f"ROC-AUC Score            : {roc_auc:.5f}")
+    print(f"Precision-Recall AUC     : {pr_auc:.5f} <-- Primary Imbalance Metric")
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(y_test, y_pred_bin))
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred_bin, target_names=['Legit', 'Fraud']))
+    print("====================================================")
+
+# ---------------------------------------------------------
+# MAIN PIPELINE EXECUTION
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    # 1. Ingest & Isolate Data
+    X_train, X_test, y_train, y_test, feature_names = load_and_preprocess_data()
+    
+    # 2. Fit Engine
+    trained_xgb_model, testing_dmatrix = train_fraud_detector(X_train, X_test, y_train, y_test)
+    
+    # 3. Assess Performance
+    evaluate_model(trained_xgb_model, testing_dmatrix, y_test)
